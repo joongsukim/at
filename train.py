@@ -7,7 +7,6 @@ from models import *
 from tqdm import tqdm
 import numpy as np
 import copy
-from adv_attack.torchattacks.attacks.pgd import PGD 
 from utils import Logger, save_checkpoint
 import torchattacks 
 from sklearn.metrics import accuracy_score 
@@ -29,7 +28,7 @@ parser.add_argument('--out-dir',type=str, default='./logs',help='dir of output')
 args = parser.parse_args()
 
 # Training settings
-args.out_dir = os.path.join(args.out_dir, args.ablation)
+args.out_dir = os.path.join(args.out_dir)
 if not os.path.exists(args.out_dir):
     os.makedirs(args.out_dir)
 
@@ -70,7 +69,8 @@ class EMA(object):
         self.buffer_keys = [k for k, _ in self.model.named_buffers()]
 
     def update_params(self, model):
-        decay = min(self.alpha, (self.step + 1) / (self.step + 10))
+        #decay = min(self.alpha, (self.step + 1) / (self.step + 10))
+        decay = self.alpha 
         state = model.state_dict()
         for name in self.param_keys:
             self.shadow[name].copy_(decay * self.shadow[name] + (1 - decay) * state[name])
@@ -109,6 +109,7 @@ def train(epoch, model, teacher_model, optimizer, device, descrip_str):
 
         pgd_atk = torchattacks.PGD(model, eps=8/255, alpha=2/255, steps=10)
         x_adv = pgd_atk(inputs,target)
+        x_adv = x_adv.to(device)
         model.train()
         lr = adjust_learning_rate(epoch)
         optimizer.param_groups[0].update(lr=lr)
@@ -124,7 +125,7 @@ def train(epoch, model, teacher_model, optimizer, device, descrip_str):
         teacher_model.update_params(model)
         teacher_model.apply_shadow()
 
-        losses.update(loss.item())
+        # losses.update(loss.item())
         
 def test(model, teacher_model, device):
     model.eval()
@@ -139,28 +140,30 @@ def test(model, teacher_model, device):
     y_pred_ema = []
     y_pred_adv_ema = []
     y_logits_ema = []
-    for batch_idx, (inputs, target) in enumerate(pbar):
-        pgd_atk = torchattacks.PGD(model, eps=8/255, alpha=2/255, steps=10)
-        pgd_atk_ema = torchattacks.PGD(teacher_model, eps=8/255, alpha=2/255, steps=10)
+    for batch_idx, (inputs, target) in enumerate(test_loader):
+        pgd_atk = torchattacks.PGD(model, eps=8/255, alpha=2/255, steps=20)
+        pgd_atk_ema = torchattacks.PGD(teacher_model.model, eps=8/255, alpha=2/255, steps=20)
         inputs, target = inputs.to(device), target.to(device)
 
         x_adv = pgd_atk(inputs,target)
+        x_adv = x_adv.to(device)
         x_adv_ema = pgd_atk(inputs,target)
+        x_adv_ema = x_adv_ema.to(device)
 
-        num_batch = targets.shape[0]
+        num_batch = target.shape[0]
         total_num += num_batch
 
         logits = model(inputs)
         logits_adv = model(x_adv)
 
-        logits_ema = model(inputs)
-        logits_adv_ema = model(x_adv_ema)
+        logits_ema = teacher_model.model(inputs)
+        logits_adv_ema = teacher_model.model(x_adv_ema)
 
 
-        loss = F.CrossEntropyLoss(logits_adv, y, reduction='mean')
-        loss_ema = F.CrossEntropyLoss(logits_adv_ema, y, reduction='mean')
+        loss = loss = nn.CrossEntropyLoss()(logits, target)
+        loss_ema = nn.CrossEntropyLoss()(logits_ema, target)
 
-        y_true.extend(y.cpu().tolist())
+        y_true.extend(target.cpu().tolist())
         y_pred_adv.extend(torch.max(logits_adv, dim=-1)[1].cpu().tolist())
         y_pred.extend(torch.max(logits, dim=-1)[1].cpu().tolist())
         y_logits.append(logits.cpu().detach().numpy())
@@ -171,10 +174,10 @@ def test(model, teacher_model, device):
         total_loss += loss.item() * num_batch
         total_loss += loss_ema.item() * num_batch 
 
-        top1 = accuracy_score(y_true, y_pred)
-        top1_adv = accuracy_score(y_true, y_pred_adv)
-        top1_ema = accuracy_score(y_true, y_pred_ema)
-        top1_adv_ema = accuracy_score(y_true, y_pred_adv_ema)
+        top1 = accuracy_score(y_true, y_pred) * 100
+        top1_adv = accuracy_score(y_true, y_pred_adv) * 100
+        top1_ema = accuracy_score(y_true, y_pred_ema) * 100 
+        top1_adv_ema = accuracy_score(y_true, y_pred_adv_ema) * 100 
 
     return top1, top1_adv, top1_ema, top1_adv_ema 
 
@@ -207,7 +210,7 @@ def main():
 
             train(epoch, model, teacher_model, optimizer, device, descrip_str)
             nat_acc, pgd20_acc, ema_nat_acc, ema_pgd20_acc = test(model, teacher_model, device=device)
-                 
+            print("model natural accuracy:", nat_acc,"pgd accuracy", pgd20_acc, "ema_model natural accuracy", ema_nat_acc, "ema pgd accuracy", ema_pgd20_acc) 
             logger_test.append([epoch, nat_acc, pgd20_acc, ema_nat_acc, ema_pgd20_acc])
             
             if pgd20_acc > best_acc_adv:
